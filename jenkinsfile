@@ -1,108 +1,145 @@
 pipeline {
     agent any
+
     tools {
-        jdk 'jdk17'
-        nodejs 'node23'
+        jdk 'JDK_17'
+        nodejs 'NodeJS'
     }
+
     environment {
-        SCANNER_HOME=tool 'sonar-scanner'
+        SCANNER_HOME = tool 'sonar-scanner'
+        DOCKER_IMAGE = 'devkng/zomato:latest'
     }
+
     stages {
-        stage ("clean workspace") {
+
+        stage('Clean Workspace') {
             steps {
                 cleanWs()
             }
         }
-        stage ("Git Checkout") {
+
+        stage('Git Checkout') {
             steps {
-                git branch: 'main', url: 'https://github.com/dinesh-official/DevOps-Zomato.git'
+                git branch: 'main',
+                    url: 'https://github.com/dinesh-official/DevOps-Zomato.git'
             }
         }
-        stage("Sonarqube Analysis"){
-            steps{
+
+        stage('SonarQube Analysis') {
+            steps {
                 withSonarQubeEnv('sonar-server') {
-                    sh ''' $SCANNER_HOME/bin/sonar-scanner -Dsonar.projectName=zomato \
-                    -Dsonar.projectKey=zomato '''
+                    sh """
+                    ${SCANNER_HOME}/bin/sonar-scanner \
+                      -Dsonar.projectName=zomato \
+                      -Dsonar.projectKey=zomato
+                    """
                 }
             }
         }
-        stage("Code Quality Gate"){
-           steps {
-                script {
-                    waitForQualityGate abortPipeline: false, credentialsId: 'Sonar-token' 
-                }
-            } 
-        }
-        stage("Install NPM Dependencies") {
-            steps {
-                sh "npm install"
-            }
-        }
-        stage('OWASP FS SCAN') {
-            steps {
-                dependencyCheck additionalArguments: '--scan ./ --disableYarnAudit --disableNodeAudit -n', odcInstallation: 'DP-Check'
-                dependencyCheckPublisher pattern: '**/dependency-check-report.xml'
-    }
-}
-        stage ("Trivy File Scan") {
-            steps {
-                sh "trivy fs . > trivy.txt"
-            }
-        }
-        stage ("Build Docker Image") {
-            steps {
-                sh "docker build -t zomato ."
-            }
-        }
-        stage ("Tag & Push to DockerHub") {
+
+        stage('Quality Gate') {
             steps {
                 script {
-                    withDockerRegistry(credentialsId: 'docker') {
-                        sh "docker tag zomato devkng/zomato:latest "
-                        sh "docker push devkng/zomato:latest "
-                    }
+                    waitForQualityGate abortPipeline: true
                 }
             }
         }
-        stage('Docker Scout Image') {
+
+        stage('Install NPM Dependencies') {
             steps {
-                script{
-                   withDockerRegistry(credentialsId: 'docker', toolName: 'docker'){
-                       sh 'docker-scout quickview devkng/zomato:latest'
-                       sh 'docker-scout cves devkng/zomato:latest'
-                       sh 'docker-scout recommendations devkng/zomato:latest'
-                   }
+                sh '''
+                node --version
+                npm --version
+                npm install
+                '''
+            }
+        }
+
+        stage('OWASP Dependency Check') {
+            steps {
+                dependencyCheck additionalArguments: '''
+                    --scan .
+                    --disableYarnAudit
+                    --disableNodeAudit
+                    --format XML
+                ''',
+                odcInstallation: 'DP-Check'
+
+                dependencyCheckPublisher pattern:
+                    '**/dependency-check-report.xml'
+            }
+        }
+
+        stage('Trivy File System Scan') {
+            steps {
+                sh '''
+                docker run --rm \
+                  -v "$PWD":/workspace \
+                  aquasec/trivy:latest \
+                  fs /workspace \
+                  --severity HIGH,CRITICAL \
+                  --no-progress \
+                  --format table > trivy.txt
+                '''
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                sh '''
+                docker build -t zomato .
+                docker images | grep zomato
+                '''
+            }
+        }
+
+        stage('Tag & Push Docker Image') {
+            steps {
+                withDockerRegistry(
+                    url: 'https://index.docker.io/v1/',
+                    credentialsId: 'docker'
+                ) {
+                    sh '''
+                    docker tag zomato ${DOCKER_IMAGE}
+                    docker push ${DOCKER_IMAGE}
+                    '''
                 }
             }
         }
-        stage ("Deploy to Container") {
+
+        stage('Deploy Container') {
             steps {
-                sh 'docker run -d --name zomato -p 3000:3000 devkng/zomato:latest'
+                sh '''
+                docker rm -f zomato || true
+                docker run -d \
+                  --name zomato \
+                  -p 3000:3000 \
+                  ${DOCKER_IMAGE}
+                '''
             }
         }
     }
+
     post {
-    always {
-        emailext attachLog: true,
-            subject: "'${currentBuild.result}'",
-            body: """
+        always {
+            emailext(
+                subject: "${currentBuild.currentResult} - ${env.JOB_NAME}",
+                body: """
                 <html>
                 <body>
-                    <div style="background-color: #FFA07A; padding: 10px; margin-bottom: 10px;">
-                        <p style="color: white; font-weight: bold;">Project: ${env.JOB_NAME}</p>
-                    </div>
-                    <div style="background-color: #90EE90; padding: 10px; margin-bottom: 10px;">
-                        <p style="color: white; font-weight: bold;">Build Number: ${env.BUILD_NUMBER}</p>
-                    </div>
-                    <div style="background-color: #87CEEB; padding: 10px; margin-bottom: 10px;">
-                        <p style="color: white; font-weight: bold;">URL: ${env.BUILD_URL}</p>
-                    </div>
+                    <h3>Build Summary</h3>
+                    <p><b>Project:</b> ${env.JOB_NAME}</p>
+                    <p><b>Build Number:</b> ${env.BUILD_NUMBER}</p>
+                    <p><b>Result:</b> ${currentBuild.currentResult}</p>
+                    <p><b>Build URL:</b> ${env.BUILD_URL}</p>
                 </body>
                 </html>
-            """,
-            to: 'dkprojects121@gmail.com',
-            mimeType: 'text/html',
-            attachmentsPattern: 'trivy.txt'
+                """,
+                to: 'dkprojects121@gmail.com',
+                mimeType: 'text/html',
+                attachmentsPattern: 'trivy.txt'
+            )
         }
     }
 }
